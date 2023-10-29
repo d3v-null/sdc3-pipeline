@@ -15,13 +15,21 @@ import shlex
 """
 salloc --nodes=1 --mem=350G --time=8:00:00 --clusters=garrawarla --partition=workq --account=mwaeor --ntasks=38 --tmp=500G
 module load singularity
-cd /nvmetmp
+cd /nvmetmp; mkdir deleteme; cd deleteme;
 cp /astro/mwaeor/dev/sdc3/img-sub_lobes/wsclean_106-196MHz_ts0720_sub_lobes_ch0-10-image.fits .
 singularity exec -B $PWD --cleanenv --home /astro/mwaeor/dev/mplhome /pawsey/mwa/singularity/ssins/ssins_latest.sif python \
     /pawsey/mwa/mwaeor/dev/sdc3-pipeline/templates/beam_correct.py \
     --lst 0.0 \
     --fits wsclean_106-196MHz_ts0720_sub_lobes_ch0-10-image.fits
 cp wsclean_106-196MHz_ts0720_sub_lobes_ch0-10-image._pbeam.fits /astro/mwaeor/dev/sdc3/img-sub_lobes/
+
+cp /astro/mwaeor/dev/sdc3/store/beam-slice-FREQ/station_beam.FREQ900.fits .
+cp /astro/mwaeor/dev/sdc3/store/uni-slice-FREQ/ZW3.msw_image.FREQ900.fits .
+singularity exec -B $PWD --cleanenv --home /astro/mwaeor/dev/mplhome /pawsey/mwa/singularity/ssins/ssins_latest.sif python \
+    /pawsey/mwa/mwaeor/dev/sdc3-pipeline/templates/beam_correct.py \
+    --fits ZW3.msw_image.FREQ900.fits \
+    --beam station_beam.FREQ900.fits
+cp ZW3.msw_image.FREQ900._pbeam.fits /astro/mwaeor/dev/sdc3/test/
 """
 
 
@@ -228,37 +236,54 @@ def airy_beam_azel(azs : np.ndarray, els : np.ndarray,
 if __name__ == '__main__':
     parser=ArgumentParser(description='generate beam corrected image')
     parser.add_argument('--fits', nargs='+', type=str, help='Name of input fitsfile')
-    parser.add_argument('--lst', type=float, help='lst of image')
+    parser.add_argument('--lst', type=float, help='lst of image', default=None)
+    parser.add_argument('--beam', help='optional beam fits file', default=None)
+    parser.add_argument('--threshold', help='optional beam fits file', default=0.01, type=float)
     if len(sys.argv) > 1:
         args = parser.parse_args()
     else:
         # is being called directly from nextflow
         args = parser.parse_args(shlex.split("${args}"))
 
-    LST = args.lst
+    beam_info = {}
+    if args.beam:
+        assert args.lst is None, "can't provide --lst and --beam"
+        with fits.open(args.beam) as hdu:
+            beam_info['wcs'] = WCS(hdu[0].header).celestial
+            beam_info['data'] = hdu[0].data
+    else:
+        assert args.lst is not None, "must provide --lst or --beam"
+
     for fn in args.fits:
         print ('Reading {}'.format(fn))
+        freq = None
         with fits.open(fn) as hdu:
             wcs = WCS(hdu[0].header).celestial
             imdata = hdu[0].data
             num_x = hdu[0].header['NAXIS1']
             num_y = hdu[0].header['NAXIS2']
-            freq = hdu[0].header['CRVAL3']
+            if 'CRVAL3' in hdu[0].header:
+                freq = hdu[0].header['CRVAL3']
 
         coord_x, coord_y = np.meshgrid(range(num_x), range(num_y))
 
         ras, decs = wcs.all_pix2world(coord_x, coord_y, 0)
-        ras *= D2R
-        decs *= D2R
-        has = LST*D2R - ras
-        azs, els = erfa.hd2ae(has, decs, latitude*D2R)
-        # generating airy beam
-        airy_values = airy_beam_azel(azs, els, LST*D2R, freq, ra0, dec0, latitude*D2R)
-        airy_beam = airy_values.reshape((1, 1, num_x, num_y))
+
+        if args.beam:
+            beam_x, beam_y = beam_info['wcs'].all_world2pix(ras, decs, 1)
+            beam = beam_info['data'][beam_y.astype(int), beam_x.astype(int)]
+        else:
+            ras *= D2R
+            decs *= D2R
+            has = args.lst*D2R - ras
+            azs, els = erfa.hd2ae(has, decs, latitude*D2R)
+            # generating airy beam
+            airy_values = airy_beam_azel(azs, els, args.lst*D2R, freq, ra0, dec0, latitude*D2R)
+            beam = airy_values.reshape((1, 1, num_x, num_y))
         # primary beam correction
-        sensible_idxs = np.where(airy_beam > 0.01)
+        sensible_idxs = np.where(beam > args.threshold)
         pbeam_imdata = np.full_like(imdata, np.nan)
-        pbeam_imdata[sensible_idxs] = imdata[sensible_idxs] / airy_beam[sensible_idxs]
+        pbeam_imdata[sensible_idxs] = imdata[sensible_idxs] / beam[sensible_idxs]
         # writing out to fits file
         outfile = fn.replace('fits', '_pbeam.fits')
         fits.writeto(outfile, pbeam_imdata, header=hdu[0].header, overwrite=True)

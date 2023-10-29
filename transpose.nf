@@ -206,7 +206,7 @@ process uvfMerge {
     label "mem_half"
     label "nvme"
 
-    time 1.hour
+    time { [meta.ts.size * 1.hour / 12, 23.55.hour].min() }
 
     script:
     uvfs = coerceList(uvfs)
@@ -467,7 +467,9 @@ process wsclean {
     label "cpu_full"
     label "mem_full"
     label "nvme"
-    time 12.hour
+    time 16.hour
+
+    errorStrategy 'ignore'
 
     script:
     vis_ms = vis.collect {"${it.baseName}.ms"}
@@ -486,6 +488,18 @@ process wsclean {
         if (params.wscleanSaveSrcs) {
             args += " -fit-spectral-log-pol 2"
         }
+    }
+    if (params.imgTaperGaussian != null) {
+        args += " -taper-gaussian ${params.imgTaperGaussian}"
+    }
+    if (params.imgNiter != null) {
+        args += " -niter ${params.imgNiter}"
+    }
+    if (params.imgAutoThreshold != null) {
+        args += " -auto-threshold ${params.imgAutoThreshold}"
+    }
+    if (params.imgAutoMask != null) {
+        args += " -auto-mask ${params.imgAutoMask}"
     }
     """
     #!/bin/bash -eux
@@ -539,15 +553,15 @@ process bane {
     output:
     tuple val(imgName), val(meta), path(bkg), path(rms)
 
-    storeDir "${params.storeDir}/mergeImg/${imgName}"
+    storeDir "${params.storeDir}/${meta.store?:'mergeImg'}/${imgName}"
 
     tag "${imgName}.${fits.baseName}"
 
     label "bane"
-    label "cpu_full"
-    label "mem_full"
+    label "cpu_half"
+    label "mem_half"
 
-    time {5.min * task.attempt}
+    time {10.min * task.attempt}
 
     script:
     bkg = "${fits.baseName}_bkg.fits"
@@ -560,34 +574,75 @@ process bane {
 
 process sourceFind {
     input:
-    tuple val(imgName), val(meta), path(img), path(bkg), path(rms), path(psf)
+    tuple val(imgName), val(meta), path(img), path(bkg), path(rms)
+    //, path(psf)
     output:
     tuple val(imgName), val(meta), \
-        path("aegean_${img.baseName}_comp.fits"), \
-        path("aegean_${img.baseName}_comp.reg") // TODO: why does aegean add this crap on the end?
+        path(comp_tab), \
+        path(isle_tab), \
+        path(comp_reg), \
+        path(isle_reg)
 
-    storeDir "${params.storeDir}/mergeImg/${imgName}"
+    storeDir "${params.storeDir}/${meta.store?:'mergeImg'}/${imgName}"
 
     tag "${imgName}.${img.baseName}"
 
     label "aegean"
     label "cpu_half"
-    label "mem_full"
+    label "mem_half"
 
-    time 10.minute
+    time 50.minute
 
     script:
-    bkg = "${img.baseName}_bkg.fits"
-    rms = "${img.baseName}_rms.fits"
+    // bkg = "${img.baseName}_bkg.fits"
+    // rms = "${img.baseName}_rms.fits"
+    tab = "aegean_${img.baseName}.fits"
+    comp_tab = "aegean_${img.baseName}_comp.fits"
+    isle_tab = "aegean_${img.baseName}_isle.fits"
+    reg = "aegean_${img.baseName}.reg"
+    comp_reg = "aegean_${img.baseName}_comp.reg"
+    isle_reg = "aegean_${img.baseName}_isle.reg"
+    assert meta['centerFreqHz']
     """
-    #!/bin/bash
-    // BANE ${img} --cores ${task.cpus}
-    aegean ${img} \
-        --hdu 0 --slice 0 \
-        --noise=${rms} --background=${bkg} --cores=${task.cpus} \
-        --table aegean_${img.baseName}.fits,aegean_${img.baseName}.reg
-    ls -alt
+    #!/usr/bin/env python3
+    from AegeanTools.CLI import aegean
+    import re
+    aegean.main([
+        "${img}",
+        "--hdu=0",
+        "--slice=0",
+        "--island",
+        "--seedclip=${params.aeSeedClip}",
+        "--noise=${rms}",
+        "--background=${bkg}",
+        "--cores=${task.cpus}",
+        "--table=${tab},${reg}"
+    ])
+    # write headers from image to catalogues
+    from astropy.io import fits
+    with fits.open("${img}") as hdus:
+        imhead = hdus[0].header
+    for path in ["${comp_tab}", "${isle_tab}"]:
+        with fits.open(path, mode="update") as hdus:
+            for key in imhead:
+                if re.match(r'^(CTYPE|CRVAL|CRPIX|CDELT|CROTA|CUNIT)', key):
+                    hdus[0].header[f"I{key[1:]}"] = imhead[key]
+                elif key == "DATE-OBS":
+                    hdus[0].header[key] = imhead[key]
+            hdus[1].header["FREQ_HZ"] = ${meta.centerFreqHz}
+            hdus.flush()
     """
+    // #!/bin/bash
+    // # BANE ${img} --cores ${task.cpus}
+    // aegean ${img} \
+    //     --hdu=0 --slice=0 \
+    //     --seedclip=${params.aeSeedClip} \
+    //     --noise=${rms} \
+    //     --background=${bkg} \
+    //     --cores=${task.cpus} \
+    //     --table=${tab},${reg}
+
+    // --psf=${psf} \
     // high_res = 0.00240241718342004
     // low_res = 0.00266511900788808
 
@@ -818,7 +873,13 @@ def getTimeblockName(timesteps) {
     tbName
 }
 
+// given uvfs with a single channel, multiple timestamps,
+// split into timeblocks of splitTime
+// then merge across spectral windows of spWidthHz
 workflow uvfTranspose {
+    if (params.baseConfig) {
+        raise new Exception("provide a config file with -c")
+    }
     uvfs = channel.fromPath(params.uvfGlob).map { [it.baseName, it] }
     uvfs | uvMeta
     baseMeta = uvMeta.out.map { baseName, metaJson ->
@@ -827,10 +888,18 @@ workflow uvfTranspose {
             freqs = meta.freqs?:[]
             def summary = [
                 times: meta.times?:[],
-                freqs: meta.freqs?:[]
+                freqs: meta.freqs?:[].collect { it.intValue() }
             ]
             [baseName, summary]
         }
+        // instead of filtering frequencies like this, it's better to change uvfglob
+        // .filter { baseName, meta ->
+        //     (!params.doFilter || (
+        //         (params.filterFreqs == null ||
+        //             (meta.freqs as Set).intersect(params.filterFreqs).size > 0
+        //         )
+        //     ))
+        // }
     merges = baseMeta.join(uvfs)
         .flatMap { baseName, meta, uvf ->
             // get spwIndex if spWidthHz is set
@@ -842,19 +911,25 @@ workflow uvfTranspose {
                     .setScale(0, RoundingMode.DOWN).intValue()
             }
             times = meta.times?:[]
+            // if (params.doFilter && params.filterTimes) {
+            //     times = ((times as Set).intersect(params.filterTimes?:[]) as ArrayList).sort(false)
+            // }
             times.withIndex()
+                .findAll { time, idx -> (!params.doFilter || params.filterTimes == null || idx in params.filterTimes) }
                 .collate(params.splitTime)
                 .collect { time_chunk ->
                     lst_rad = time_chunk[(time_chunk.size/2).intValue()][0].lst_rad
+                    first_gps = time_chunk[0][0].gps.intValue()
                     time_idxs = time_chunk.collect { it[1] }
                     // print("tb ${tb} lst_rad ${lst_rad}")
-                    [spwIdx, time_idxs, lst_rad, firstFreqHz, uvf]
+                    [spwIdx, time_idxs, lst_rad, first_gps, firstFreqHz, uvf]
                 }
         }
         // deleteme: filter times and channels
-        .filter { _spwIdx, ts, lst_rad, fq, _uvf ->
+        .filter { _spwIdx, ts, lst_rad, first_gps, fq, _uvf ->
             tb = deepcopy(getTimeblockName(ts))
             spw = deepcopy(getSpwName([fq]))
+
             filtTb = params.filterTimeblocks?:[tb]
             filtSpw = params.filterSpws?:[spw]
             // print("filter tb ${tb} spw ${spw} filtTb ${filtTb} filtSpw ${filtSpw}")
@@ -863,17 +938,24 @@ workflow uvfTranspose {
                 && (filtSpw).contains(spw)
             )
         }
-        .groupTuple(by: 0..2)
-        .map { _spwIdx, ts, lst_rad, freqs, mergeUvfs ->
+        .groupTuple(by: 0..3)
+        .map { _spwIdx, ts, lst_rad, first_gps, freqs, mergeUvfs ->
+            freqs = freqs.target as ArrayList
+            freqs.sort(true)
+            centerFreqHz = freqs[(freqs.size/2).intValue()]
+            lambda_m = 299792458 / centerFreqHz
             meta = [
                 splitName: getTimeblockName(ts),
-                freqs: freqs.target.sort(false) as ArrayList,
+                freqs: deepcopy(freqs),
                 ts: ts.sort(false) as ArrayList,
                 lst_rad: lst_rad,
-                spwName: getSpwName(freqs)
+                spwName: getSpwName(freqs),
+                lambda_m: lambda_m,
+                centerFreqHz: centerFreqHz,
+                first_gps: first_gps,
             ]
             mergeName = "${meta.spwName}_${meta.splitName}"
-            [mergeName, deepcopy(meta), mergeUvfs.target as ArrayList]
+            [mergeName, deepcopy(meta), mergeUvfs.target.sort(false) as ArrayList]
         }
     merges
         // .take(1) // <- deleteme
@@ -932,7 +1014,8 @@ workflow uvfTranspose {
     if (params.doGrid) {
         hypSub.out.map { mergeName, meta, vis ->
                 def tbName = getTimeblockName(meta.ts)
-                def gpsTime = params.firstGpsTime + (meta.ts[0]?:0) * params.intTime
+                // def gpsTime = params.firstGpsTime + (meta.ts[0]?:0) * params.intTime
+                def gpsTime = meta.first_gps
                 def chanWidthHz = params.inWidthHz
                 def chansPerGrid = (params.gridWidthHz / chanWidthHz).intValue()
                 def (startFreqsHz, spwNames) = deepcopy(meta.freqs).unique(false).sort(false).withIndex()
@@ -1049,18 +1132,19 @@ workflow uvfTranspose {
         mergeImgs = uvfMerge.out.flatMap {mergeName, meta, vis ->
                 deepcopy(meta.freqs).unique(false).sort(false).withIndex()
                     .collate((params.imgWidthHz / params.inWidthHz).intValue(), false)
-                    // .take(1) // deleteme
                     .collect { fi_chunk ->
                         startFreqHz = fi_chunk[0][0]
                         startFreqIdx = fi_chunk[0][-1]
                         endFreqHz = fi_chunk[-1][0]
                         endFreqIdx = fi_chunk[-1][-1]
+                        centerFreqHz = (startFreqHz + endFreqHz) / 2
                         spwName = getSpwName([startFreqHz, endFreqHz])
                         wscArgs = "${params.wscleanCommon} ${params.wscleanMsw} ${params.wscleanMswExtra}"
                         newMeta = [
                             spwName:spwName,
                             startFreqIdx:startFreqIdx,
-                            endFreqIdx:endFreqIdx
+                            endFreqIdx:endFreqIdx,
+                            centerFreqHz:centerFreqHz,
                         ]
                         ["${spwName}_${meta.splitName}_msw", deepcopy(meta) + newMeta, vis, wscArgs]
                     }
@@ -1072,18 +1156,19 @@ workflow uvfTranspose {
         modelImgs = hypCal.out.flatMap {mergeName, meta, _soln, model ->
                 deepcopy(meta.freqs).unique(false).sort(false).withIndex()
                     .collate((params.imgWidthHz / params.inWidthHz).intValue(), false)
-                    // .take(1) // deleteme
                     .collect { fi_chunk ->
                         startFreqHz = fi_chunk[0][0]
                         startFreqIdx = fi_chunk[0][-1]
                         endFreqHz = fi_chunk[-1][0]
                         endFreqIdx = fi_chunk[-1][-1]
+                        centerFreqHz = (startFreqHz + endFreqHz + params.inWidthHz) / 2
                         spwName = getSpwName([startFreqHz, endFreqHz])
                         wscArgs = "${params.wscleanCommon} ${params.wscleanMsw} ${params.wscleanMswExtra}"
                         newMeta = [
                             spwName:spwName,
                             startFreqIdx:startFreqIdx,
-                            endFreqIdx:endFreqIdx
+                            endFreqIdx:endFreqIdx,
+                            centerFreqHz:centerFreqHz,
                         ]
                         ["${spwName}_${meta.splitName}_model_msw", deepcopy(meta) + newMeta, model, wscArgs]
                     }
@@ -1095,19 +1180,19 @@ workflow uvfTranspose {
         subImgs = hypSub.out.flatMap {mergeName, meta, vis ->
                 deepcopy(meta.freqs).unique(false).sort(false).withIndex()
                     .collate((params.imgWidthHz / params.inWidthHz).intValue(), false)
-                    // .take(1) // deleteme
-                    // .findAll { it[-1][-1] != it[0][-1] }
                     .collect { fi_chunk ->
                         startFreqHz = fi_chunk[0][0]
                         startFreqIdx = fi_chunk[0][-1]
                         endFreqHz = fi_chunk[-1][0]
                         endFreqIdx = fi_chunk[-1][-1]
+                        centerFreqHz = (startFreqHz + endFreqHz) / 2
                         spwName = getSpwName([startFreqHz, endFreqHz])
                         wscArgs = "${params.wscleanCommon} ${params.wscleanMsw} ${params.wscleanMswExtra}"
                         newMeta = [
                             spwName:spwName,
                             startFreqIdx:startFreqIdx,
-                            endFreqIdx:endFreqIdx
+                            endFreqIdx:endFreqIdx,
+                            centerFreqHz:centerFreqHz,
                         ]
                         ["${spwName}_${meta.splitName}${params.calSuffix?:''}${params.subSuffix?:''}_msw", deepcopy(meta) + newMeta, vis, wscArgs]
                     }
@@ -1118,26 +1203,7 @@ workflow uvfTranspose {
 
     mergeImgs.mix(subImgs).mix(modelImgs)
         | wsclean
-
-    // break out image products into images and psfs
-    imgPsfs = wsclean.out.map { imgName, meta, fitss ->
-            imgs = fitss.findAll { it.name =~ /.*-image.fits/ }
-            psfs = fitss.findAll { it.name =~ /.*-psf.fits/ }
-            if (imgs.size != 1 && psfs.size != 1) {
-                imgs = fitss.findAll { it.name =~ /.*-MFS-image.fits/ }
-                psfs = fitss.findAll { it.name =~ /.*-MFS-psf.fits/ }
-            }
-            assert imgs.size == 1 && psfs.size == 1
-            [imgName, meta, imgs[0], psfs[0]]
-        }
-    imgPsfs.map { imgName, meta, img, psf -> [imgName, meta, img] }
-        | pbCorrect
-        | bane
-
-    pbCorrect.out
-        .join(bane.out.map { imgName, meta, bkg, rms -> [imgName, bkg, rms] })
-        .join(imgPsfs.map { imgName, meta, img, psf -> [imgName, psf] })
-        | sourceFind
+        | postImg
 
     solFrames.mix(chipsFrames)
         .groupTuple()
@@ -1148,14 +1214,66 @@ workflow uvfTranspose {
             [name, pngs.sort(), cachebust]
         }
         | ffmpeg
-
-    // wsclean.out.flatMap { imgName, files ->
-    //         def (spwName, tbName, subName, imgType) = imgName.split('_')
-    //         files.findAll { it.baseName =~ /.*MFS-image/ }.collect { fits ->
-    //             ["${spwName}_${subName}_${imgType}", fits]
-    //         }
-    //     }
 }
+
+// workflow postImgEntry {
+//     imgName = "wsclean_model_106-196MHz_ts0720-0731_ch0-10"
+//     postImg(channel.fromList([
+//         [
+//             files("/astro/mwaeor/dev/sdc3/img-model_lobes/wsclean_model_106-196MHz_ts0720-0731_ch0-10-MFS-{image,psf}.fits")
+//         ]
+//     ]))
+// }
+
+// post processing for images:
+// - beam correction
+// - noise estimation
+// - source finding
+workflow postImg {
+    take:
+        // tuple of (imgName, meta, files) for each run
+        imgProducts
+
+    main:
+        // break out image products into pairs of images and psfs
+        imgPsfs = imgProducts.map { imgName, meta, files ->
+                imgs = files.findAll { it.name =~ /.*-image.fits/ }
+                psfs = files.findAll { it.name =~ /.*-psf.fits/ }
+                if (imgs.size != 1 && psfs.size != 1) {
+                    imgs = files.findAll { it.name =~ /.*-MFS-image.fits/ }
+                    psfs = files.findAll { it.name =~ /.*-MFS-psf.fits/ }
+                }
+                assert imgs.size == 1 && psfs.size == 1
+                [imgName, meta, imgs[0], psfs[0]]
+            }
+
+        // make sourcefinding masks
+        // imgPsfs.map { imgName, meta, img, psf -> [imgName, meta, psf] }
+        //     | mask
+
+        // bane pbcorrected imgs
+        imgPsfs.map { imgName, meta, img, psf -> [imgName, meta, img] }
+            | pbCorrect
+            | bane
+
+        if (params.doAegean) {
+            pbCorrect.out
+                .join(bane.out.map { imgName, meta, bkg, rms -> [imgName, bkg, rms] })
+                // .join(imgPsfs.map { imgName, meta, img, psf -> [imgName, psf] })
+                | sourceFind
+        }
+}
+
+// workflow mask {
+//     take:
+//         // tuple of (imgName, meta, img, psf) for each run
+//         imgPsfs
+
+//     main:
+//         imgPsfs.map { imgName, meta, psf -> [imgName, meta, psf] }
+//             | bane
+//             | sourceFind
+// }
 
 // workflow msTranspose {
 //     uv = channel.fromPath(params.msGlob, type: 'dir').map { [it.baseName, it] }

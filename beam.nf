@@ -8,7 +8,7 @@ process fitsJson {
     output:
         path(json)
 
-    storeDir "${params.outdir}"
+    storeDir "${params.outDir}"
     tag "${fits.baseName}"
     label "python"
     // label "nvme"
@@ -25,7 +25,7 @@ process fitsSlice {
     output:
         tuple val(meta), path(out_glob)
 
-    storeDir "${params.outdir}/${meta.store}"
+    storeDir "${params.outDir}/${meta.store}"
 
     tag "${fits.baseName}.${meta.axis}{${indices[0]}..${indices[-1]}}"
 
@@ -55,7 +55,7 @@ process thumbnail {
     output:
         tuple path("${img.baseName}.png"), val(meta)
 
-    storeDir "${params.outdir}/${meta.store}"
+    storeDir "${params.outDir}/${meta.store}"
 
     tag "${img.baseName}"
 
@@ -91,7 +91,7 @@ process ffmpeg {
     output:
         tuple path("${name}.mp4"), path("${dot_cachebust}")
 
-    storeDir "${params.outdir}"
+    storeDir "${params.outDir}"
     stageInMode "symlink"
 
     tag "${name}"
@@ -191,7 +191,6 @@ workflow sliceFreqs {
 
 workflow {
     print("processing ${params.time_varying_station_beam}")
-    // def beam = file(params.time_varying_station_beam)
 
     channel.of(file(params.time_varying_station_beam))
         | sliceTimes

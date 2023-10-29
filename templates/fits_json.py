@@ -10,11 +10,11 @@ import numpy as np
 """
 salloc --nodes=1 --mem=350G --time=8:00:00 --clusters=garrawarla --partition=workq --account=mwaeor --ntasks=38 --tmp=500G
 cd /nvmetmp
-cp /astro/mwaeor/dev/sdc3/Image/station_beam_time-varying.fits .
+cp /astro/mwaeor/dev/sdc3/Image/ZW3.msw_image.fits .
 singularity exec -B \$PWD --cleanenv --home /astro/mwaeor/dev/mplhome /pawsey/mwa/singularity/ssins/ssins_latest.sif python \
     /pawsey/mwa/mwaeor/dev/sdc3-pipeline/templates/fits_json.py \
-    --fits station_beam_time-varying.fits \
-    --json /astro/mwaeor/dev/sdc3/store/station_beam_time-varying.json
+    --fits ZW3.msw_image.fits \
+    --json test.json
 """
 
 
@@ -62,7 +62,11 @@ def main():
                     axis_data['values'] = make_fits_axis_array(hdu, axis+1).tolist()
                 data[name]['axes'].append(axis_data)
             for key in hdu.header:
-                data[name][key] = hdu.header[key]
+                val = hdu.header[key]
+                # check for astropy.io.fits.header._HeaderCommentaryCards
+                if hasattr(val, '__str__'):
+                    val = val.__str__()
+                data[name][key] = val
 
     with open(args.json, 'w') as json:
         json_dump(data, json, indent=4)
