@@ -2,7 +2,9 @@
 
 ## Technical details
 
-todo: link the google doc
+Please read the technical details PDF for a description of our approach [Technical Details](SDC3%20reproducibility%20-%20Wizards%20of%20Oz%203D.pdf)
+
+This repository contains only the nextflow pipeline that ties together the rest of the software we used.
 
 ## Flows
 
